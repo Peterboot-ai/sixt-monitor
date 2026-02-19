@@ -4,6 +4,7 @@ Monitorador de Preços Sixt com Alertas Telegram
 """
 
 import os
+import json
 import requests
 from datetime import datetime
 
@@ -11,18 +12,32 @@ from datetime import datetime
 # CONFIGURAÇÕES
 # ============================================
 
-# Alerta de preço
-ALERT_BELOW_PRICE = 2500  # Alerta se preço cair abaixo disso
-CURRENT_PRICE = 2850      # Preço inicial para calcular economia
+# Dados da sua busca (extraídos da URL)
+PICKUP_LOCATION_ID = "dce4741f-3763-4aa1-a6cd-917db41db2f5"
+DROPOFF_LOCATION_ID = "dce4741f-3763-4aa1-a6cd-917db41db2f5"
+BRANCH_ID = "47567"
+PICKUP_DATE = "2026-12-17T12:00"
+DROPOFF_DATE = "2026-12-26T12:00"
+OFFER_MATRIX_ID = "56b5908b-27a4-427c-9e4d-094e411f3389"
 
-# Telegram (vem das variáveis de ambiente)
+# Alerta de preço
+ALERT_BELOW_PRICE = 2500
+CURRENT_PRICE = 2850
+
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# URL da sua busca na Sixt (para referência)
-SIXT_URL = "https://www.sixt.com/betafunnel/#/offerlist?wakz=BRL&zen_pu_location=8b9f251d-c402-4915-aee6-d2aeba062777&zen_do_location=8b9f251d-c402-4915-aee6-d2aeba062777&zen_pu_time=2026-12-17T11%3A30&zen_do_time=2026-12-26T11%3A30"
-
 # ============================================
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+    "Origin": "https://www.sixt.com",
+    "Referer": "https://www.sixt.com/",
+}
+
 
 def send_telegram_message(message: str) -> bool:
     """Envia mensagem via Telegram."""
@@ -31,7 +46,6 @@ def send_telegram_message(message: str) -> bool:
         return False
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
@@ -43,53 +57,219 @@ def send_telegram_message(message: str) -> bool:
         response.raise_for_status()
         print("✅ Mensagem enviada via Telegram!")
         return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Erro ao enviar Telegram: {e}")
+    except Exception as e:
+        print(f"❌ Erro Telegram: {e}")
         return False
 
 
 def format_price(price: float) -> str:
-    """Formata o preço para exibição."""
     return f"R$ {price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def try_api_v1():
+    """Tenta API v1 da Sixt."""
+    url = "https://web-api.orange.sixt.com/v1/rentaloffers/offers"
+    params = {
+        "pickupStation": BRANCH_ID,
+        "returnStation": BRANCH_ID,
+        "pickupDate": PICKUP_DATE,
+        "returnDate": DROPOFF_DATE,
+        "currency": "BRL",
+        "vehicleType": "car",
+        "areaCode": "us",
+    }
+    response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def try_api_v2():
+    """Tenta API v2 da Sixt."""
+    url = f"https://web-api.orange.sixt.com/v2/rentaloffers/offers"
+    params = {
+        "pickupStation": BRANCH_ID,
+        "returnStation": BRANCH_ID,
+        "pickupDate": PICKUP_DATE,
+        "returnDate": DROPOFF_DATE,
+        "currency": "BRL",
+        "vehicleType": "car",
+    }
+    response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def try_api_locations():
+    """Tenta API com location IDs."""
+    url = "https://web-api.orange.sixt.com/v1/locations"
+    params = {"term": "Naperville"}
+    response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def try_rental_api():
+    """Tenta API de rental."""
+    url = "https://www.sixt.com/php/reservation/offermatrix"
+    params = {
+        "pickupStation": BRANCH_ID,
+        "returnStation": BRANCH_ID,
+        "pickupDate": PICKUP_DATE,
+        "returnDate": DROPOFF_DATE,
+    }
+    response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_prices():
+    """Tenta várias APIs para obter preços."""
+    apis = [
+        ("API v1", try_api_v1),
+        ("API v2", try_api_v2),
+        ("API Locations", try_api_locations),
+        ("API Rental", try_rental_api),
+    ]
+    
+    results = {}
+    for name, func in apis:
+        try:
+            print(f"   Tentando {name}...")
+            data = func()
+            results[name] = {"success": True, "data": data}
+            print(f"   ✅ {name} funcionou!")
+        except Exception as e:
+            results[name] = {"success": False, "error": str(e)}
+            print(f"   ❌ {name}: {e}")
+    
+    return results
+
+
+def extract_prices(results):
+    """Extrai preços dos resultados das APIs."""
+    offers = []
+    
+    for name, result in results.items():
+        if not result.get("success"):
+            continue
+        
+        data = result.get("data", {})
+        
+        # Tenta diferentes estruturas de resposta
+        offer_list = data.get("offers", [])
+        if not offer_list:
+            offer_list = data.get("vehicles", [])
+        if not offer_list:
+            offer_list = data.get("results", [])
+        
+        for offer in offer_list:
+            try:
+                # Tenta extrair nome do veículo
+                vehicle = offer.get("vehicleGroupInfo", {}).get("modelExample", {}).get("name", "")
+                if not vehicle:
+                    vehicle = offer.get("title", offer.get("name", "Veículo"))
+                
+                # Tenta extrair preço
+                price = 0
+                if "prices" in offer:
+                    price = offer["prices"].get("totalPrice", {}).get("amount", 0)
+                if not price and "price" in offer:
+                    price = offer["price"].get("amount", offer["price"]) if isinstance(offer["price"], dict) else offer["price"]
+                if not price:
+                    price = offer.get("totalAmount", offer.get("total", 0))
+                
+                if price and float(price) > 0:
+                    offers.append({
+                        "vehicle": vehicle,
+                        "price": float(price),
+                        "source": name,
+                    })
+            except:
+                continue
+    
+    return offers
+
+
 def check_prices():
-    """Função principal que verifica os preços."""
+    """Função principal."""
     print(f"\n{'='*50}")
     print(f"🚗 Monitorador de Preços Sixt")
     print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print(f"{'='*50}")
     
-    # Como a API da Sixt não está acessível diretamente,
-    # vamos usar uma abordagem alternativa com notificação de status
-    
-    print(f"\n📊 Configuração atual:")
-    print(f"   Preço inicial: {format_price(CURRENT_PRICE)}")
-    print(f"   Alvo: {format_price(ALERT_BELOW_PRICE)}")
+    print(f"\n📋 Configuração:")
     print(f"   Local: Naperville/Marriott")
     print(f"   Período: 17-26/Dez/2026")
+    print(f"   Preço inicial: {format_price(CURRENT_PRICE)}")
+    print(f"   Alvo: {format_price(ALERT_BELOW_PRICE)}")
     
-    # Envia mensagem de status no Telegram
-    message = f"""🚗 <b>Monitor Sixt - Status</b>
+    print(f"\n🔍 Buscando preços...")
+    results = get_prices()
+    
+    # Conta sucessos e falhas
+    successes = sum(1 for r in results.values() if r.get("success"))
+    failures = len(results) - successes
+    
+    print(f"\n📊 Resultado: {successes} APIs funcionaram, {failures} falharam")
+    
+    # Extrai preços
+    offers = extract_prices(results)
+    
+    if offers:
+        lowest = min(offers, key=lambda x: x["price"])
+        print(f"\n💰 Menor preço encontrado: {format_price(lowest['price'])}")
+        print(f"   Veículo: {lowest['vehicle']}")
+        
+        if lowest["price"] <= ALERT_BELOW_PRICE:
+            message = f"""🚨 <b>ALERTA DE PREÇO SIXT!</b>
+
+💰 <b>Preço:</b> {format_price(lowest['price'])}
+🎯 <b>Alvo:</b> {format_price(ALERT_BELOW_PRICE)}
+💵 <b>Economia:</b> {format_price(CURRENT_PRICE - lowest['price'])}
+
+🚙 {lowest['vehicle']}
+📍 Naperville/Marriott
+📅 17-26/Dez/2026
+
+⚡ Reserve agora!"""
+            send_telegram_message(message)
+        else:
+            diff = lowest["price"] - ALERT_BELOW_PRICE
+            print(f"   📈 Ainda {format_price(diff)} acima do alvo")
+            
+            # Envia status
+            message = f"""📊 <b>Monitor Sixt - Status</b>
 
 📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}
 
-📊 <b>Configuração:</b>
-- Preço inicial: {format_price(CURRENT_PRICE)}
-- Alvo: {format_price(ALERT_BELOW_PRICE)}
-- Local: Naperville/Marriott
-- Período: 17-26/Dez/2026
+💰 Menor preço: {format_price(lowest['price'])}
+🎯 Alvo: {format_price(ALERT_BELOW_PRICE)}
+📈 Diferença: {format_price(diff)} acima
 
-⚠️ <b>Nota:</b> A API da Sixt não permite consulta automática de preços. 
+🚙 {lowest['vehicle']}
+📍 Naperville/Marriott"""
+            send_telegram_message(message)
+    else:
+        print("\n⚠️  Nenhum preço encontrado nas APIs")
+        
+        # Salva respostas para debug
+        debug_info = {name: str(r)[:500] for name, r in results.items()}
+        print(f"\n📝 Debug: {json.dumps(debug_info, indent=2)}")
+        
+        # Envia status mesmo sem preço
+        message = f"""📊 <b>Monitor Sixt - Status</b>
 
-💡 <b>Recomendação:</b> Use o AutoSlash para monitoramento automático:
-https://www.autoslash.com/track
+📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}
 
-Ou verifique manualmente:
+⚠️ Não foi possível obter preços automaticamente.
+
+📍 Naperville/Marriott
+📅 17-26/Dez/2026
+🎯 Alvo: {format_price(ALERT_BELOW_PRICE)}
+
+💡 Verifique manualmente:
 https://www.sixt.com"""
-
-    send_telegram_message(message)
-    print("\n✅ Mensagem de status enviada!")
+        send_telegram_message(message)
 
 
 if __name__ == "__main__":
